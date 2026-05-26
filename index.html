@@ -2730,7 +2730,7 @@ function flashPrice(dir) {
 }
 
 function updateStatsStrip() {
-  const curBal = authed ? balance : demoBalance;
+  const curBal = (authed && balance !== null) ? balance : demoBalance;
   const balEl = $('stBal');
   if(curBal !== null && curBal > 0) {
     balEl.textContent = `$${curBal.toFixed(2)}`;
@@ -3526,11 +3526,11 @@ function saveSettings() {
       TRAIL_DIST: CFG.TRAIL_DIST,
     }));
   } catch(e) {}
-  if(!authed && newBal > 0) {
+  // In Twelve Data mode there is no real broker balance — always use demoBalance
+  if (newBal > 0) {
     demoBalance = newBal; demoStartBal = newBal; demoPositions = [];
     tradingLocked = false; consecutiveLosses = 0; consecutiveWins = 0; riskHalved = false;
     resetHardFloor(newBal);
-    // Reset live session history
     liveEquity = [newBal]; liveMaxBal = newBal; liveMaxDD = 0;
     wins = 0; losses = 0; demoTradeLog = [];
   }
@@ -3543,14 +3543,14 @@ function saveSettings() {
 
 function updateDepositNotice() {
   const notice = $('depositNotice');
-  const hasBal = authed ? (balance > 0) : (demoBalance > 0);
+  const hasBal = (authed && balance !== null) ? (balance > 0) : (demoBalance > 0);
   notice.style.display = hasBal ? 'none' : 'block';
 }
 function updateTargetBar() {
   const target = CFG.PROFIT_TARGET;
   if(!target) { $('targetBarFill').style.width = '0%'; $('targetBarLabel').textContent = '—'; return; }
-  const curBal = authed ? balance : demoBalance;
-  const curStart = authed ? (CFG.START_BALANCE||curBal) : demoStartBal;
+  const curBal   = (authed && balance !== null) ? balance : demoBalance;
+  const curStart = (authed && balance !== null) ? (CFG.START_BALANCE || curBal) : demoStartBal;
   const gain = curBal ? Math.max(0,(curBal - curStart)) : 0;
   const pct = Math.min(100,(gain/target)*100);
   $('targetBarFill').style.width = pct + '%';
