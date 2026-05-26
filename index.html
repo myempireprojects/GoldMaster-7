@@ -1024,6 +1024,8 @@ let   TD_API_KEY    = '';          // populated from Setup input
 
 let _tdPollTimer  = null;         // setInterval handle for live price polling
 let _tdPollActive = false;
+let _localWS      = null;         // WebSocket handle — local Python candle server
+let _wsConnected  = false;
 
 const CFG = {
   RISK_PCT     : 1.0,
@@ -3811,12 +3813,131 @@ async function _tdPollOnce() {
   }
 }
 
+// ── LOCAL PYTHON SERVER — WebSocket client ────────────────────────────────────
+// Attempts to connect to the local server.py candle engine on ws://localhost:8765.
+// On success: 1-second clean ticks flow directly into _processTick.
+// On failure: silently falls back to Twelve Data 10-second polling.
+function _wsConnect() {
+  return new Promise(resolve => {
+    let resolved = false;
+    const done = (ok) => { if (!resolved) { resolved = true; resolve(ok); } };
+
+    let ws;
+    try { ws = new WebSocket('ws://localhost:8765'); }
+    catch (_) { done(false); return; }
+
+    // Timeout — if no open event within 2 s, give up
+    const timeout = setTimeout(() => { ws.close(); done(false); }, 2000);
+
+    ws.onopen = () => {
+      clearTimeout(timeout);
+      _localWS     = ws;
+      _wsConnected = true;
+      setConn('on');
+      authed = true;
+      addSignal('info', '🔗 Local Python candle server detected — 1 s live ticks active', null);
+      done(true);
+    };
+
+    ws.onmessage = evt => {
+      try {
+        const msg = JSON.parse(evt.data);
+
+        // ── Tick: update price display + feed candle builder ──
+        if (msg.type === 'tick') {
+          bid = msg.bid; ask = msg.ask;
+          const newMid  = msg.mid;
+          const epochSec = msg.epoch;
+
+          if (mid && newMid !== mid) {
+            const diff = newMid - mid, dir = diff > 0 ? 'up' : 'dn';
+            const chgEl = $('priceChg');
+            chgEl.textContent = `${diff > 0 ? '+' : ''}${diff.toFixed(2)}`;
+            chgEl.className   = `price-chg ${dir}`;
+            flashPrice(dir);
+          }
+          prevMid = mid; mid = newMid;
+          $('priceMain').textContent = mid.toFixed(2);
+          updatePriceBadges(bid, ask);
+
+          // Feed into the internal candle engine (same path as TD polling)
+          _processTick(newMid, epochSec);
+          checkDemoPositions();
+          if (!replay.active) runStrategy();
+        }
+
+        // ── Completed bar: push directly into the candles array ──
+        else if (msg.type === 'bar') {
+          const arr = candles[msg.tf];
+          if (arr && msg.bar) {
+            const last = arr.length ? arr[arr.length - 1] : null;
+            if (!last || msg.bar.epoch > last.epoch) {
+              arr.push(msg.bar);
+              const cap = msg.tf === 60 ? 600 : msg.tf === 300 ? 200 : 100;
+              if (arr.length > cap) arr.shift();
+            }
+          }
+        }
+
+        // ── Forming bar: keep the live bar in sync ──────────────
+        else if (msg.type === 'forming') {
+          const arr = candles[msg.tf];
+          if (arr && msg.bar) {
+            const last = arr.length ? arr[arr.length - 1] : null;
+            if (last && last.epoch === msg.bar.epoch) {
+              arr[arr.length - 1] = msg.bar;   // update in-place
+            } else if (!last || msg.bar.epoch > last.epoch) {
+              arr.push(msg.bar);
+              const cap = msg.tf === 60 ? 601 : msg.tf === 300 ? 201 : 101;
+              if (arr.length > cap) arr.shift();
+            }
+          }
+        }
+
+      } catch (_) { /* malformed message — ignore */ }
+    };
+
+    ws.onerror = () => {
+      clearTimeout(timeout);
+      done(false);   // will fall through to TD polling in connect()
+    };
+
+    ws.onclose = () => {
+      _wsConnected = false; _localWS = null;
+      if (resolved) {
+        // Was previously connected — try to reconnect
+        setConn('wait');
+        addSignal('warn', '⚠ Python candle server disconnected — reconnecting in 5 s…', null);
+        setTimeout(() => {
+          _wsConnect().then(ok => { if (!ok) connect(); });
+        }, 5000);
+      }
+    };
+  });
+}
+
 // ── Start Twelve Data live feed (replaces OANDA streaming connect) ──
 async function connect() {
-  // Stop any existing poll
+  // Stop any existing poll or WebSocket
   if (_tdPollTimer) { clearInterval(_tdPollTimer); _tdPollTimer = null; }
   _tdPollActive = false;
+  if (_localWS) { _localWS.close(); _localWS = null; _wsConnected = false; }
   setConn('wait');
+
+  // ── Try local Python candle server first (ws://localhost:8765) ──
+  addSignal('info', '🔍 Checking for local Python candle server…', null);
+  const wsOk = await _wsConnect();
+  if (wsOk) {
+    // Server found — load historical bars via TD if an API key is available
+    if (TD_API_KEY) {
+      addSignal('info', '📊 Loading historical candles from Twelve Data…', null);
+      await _fetchTDHistory();
+    }
+    return;   // live feed is now driven by WebSocket ticks
+  }
+
+  // ── Fallback: Twelve Data polling every 10 s ──────────────────
+  addSignal('info', '↩ No local server found — using Twelve Data polling (10 s)', null);
 
   if (!TD_API_KEY) {
     addSignal('warn', 'Twelve Data API key not set — enter it in Setup, then click Connect.', null);
@@ -3824,7 +3945,6 @@ async function connect() {
     return;
   }
 
-  // Load history first
   const ok = await _fetchTDHistory();
   if (!ok) {
     addSignal('warn', 'TD: could not load candle history — check your API key.', null);
@@ -3837,7 +3957,6 @@ async function connect() {
   _tdPollActive = true;
   addSignal('info', 'Connected to Twelve Data — XAU/USD live feed active (polling every 10 s)', null);
 
-  // Poll immediately then every 10 seconds
   await _tdPollOnce();
   _tdPollTimer = setInterval(() => { if (_tdPollActive) _tdPollOnce(); }, 10000);
 }
