@@ -469,10 +469,10 @@ input[type=range]::-webkit-slider-thumb{
   .bar-right{display:none}
   .bar-r2{display:flex}
   .bar-r2 .nav-btn{
-    padding:4px 7px;font-size:8px;gap:3px;flex:1;justify-content:center;
+    padding:4px 6px;font-size:7.5px;gap:2px;flex:1;justify-content:center;letter-spacing:.02em;
   }
-  .bar-r2 .bot-controls{gap:5px;flex-shrink:0}
-  .bar-r2 .bc-btn{padding:4px 8px;font-size:8px}
+  .bar-r2 .bot-controls{gap:4px;flex-shrink:0}
+  .bar-r2 .bc-btn{padding:4px 9px;font-size:8px;font-weight:700;letter-spacing:.04em}
   .stats-strip{padding:0 6px;height:32px}
   .stat-cell{padding:0 6px;gap:3px}
   .stat-lbl{font-size:6.5px}
@@ -489,7 +489,7 @@ input[type=range]::-webkit-slider-thumb{
 <header class="bar">
   <div class="bar-r1">
     <div class="logo">
-      <span class="logo-hex">⬡</span>
+      <span class="logo-hex" style="display:none"></span>
       XAUUSD <sub>/ PA BOT</sub>
     </div>
     <div class="price-block">
@@ -519,15 +519,14 @@ input[type=range]::-webkit-slider-thumb{
     </div>
   </div>
   <div class="bar-r2">
-    <button class="nav-btn" id="btnFeedM" onclick="openDrawer('feed')">⚡ Feed</button>
-    <button class="nav-btn" id="btnPositionsM" onclick="openDrawer('positions')">📋 Pos</button>
-    <button class="nav-btn" id="btnSetupM" onclick="openDrawer('setup')">⚙ Setup</button>
-    <button class="nav-btn" id="btnBacktestM" onclick="openDrawer('backtest')">▶ BT</button>
-    <button class="nav-btn" id="btnHistoryM" onclick="openDrawer('history')">📊 Hist</button>
-    <button class="nav-btn" id="btnSettingsM" onclick="openDrawer('settings')">◈ Config</button>
+    <button class="nav-btn" id="btnFeedM" onclick="openDrawer('feed')">Feed</button>
+    <button class="nav-btn" id="btnSetupM" onclick="openDrawer('setup')">Setup</button>
+    <button class="nav-btn" id="btnBacktestM" onclick="openDrawer('backtest')">BT</button>
+    <button class="nav-btn" id="btnHistoryM" onclick="openDrawer('history')">Hist</button>
+    <button class="nav-btn" id="btnSettingsM" onclick="openDrawer('settings')">Config</button>
     <div class="bot-controls">
-      <button class="bc-btn bc-go" id="startBtnM">▶</button>
-      <button class="bc-btn bc-stop" id="stopBtnM" disabled>■</button>
+      <button class="bc-btn bc-go" id="startBtnM">Start</button>
+      <button class="bc-btn bc-stop" id="stopBtnM" disabled>Stop</button>
     </div>
     <div class="conn"><span class="dot" id="connDotM"></span></div>
   </div>
