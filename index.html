@@ -638,15 +638,13 @@ input[type=range]::-webkit-slider-thumb{
   </div>
   <div class="drawer-body">
     <div class="settings-section">
-      <div class="settings-section-title">OANDA API Connection</div>
+      <div class="settings-section-title">Twelve Data API Connection</div>
       <div class="demo-notice">
         <strong>🟡 DEMO MODE ACTIVE</strong>
-        Trading with simulated funds on live XAUUSD market data from OANDA.
-        Enter your OANDA Account ID and Access Token below, then click Connect.
-        Leave blank to run in demo-only mode with live price data once connected.
+        Trading with simulated funds on live XAU/USD market data via Twelve Data.
+        Get a free API key at twelvedata.com, paste it below, then click Connect.
       </div>
-      <input class="tinput" id="oandaAccountId" type="text" placeholder="OANDA Account ID (e.g. 001-001-1234567-001)"/>
-      <input class="tinput" id="oandaToken" type="password" placeholder="OANDA Access Token" style="margin-top:6px"/>
+      <input class="tinput" id="tdApiKey" type="password" placeholder="Twelve Data API Key"/>
       <button class="btn btn-auth" id="authBtn" style="margin-top:8px">Connect</button>
     </div>
     <div class="settings-section">
@@ -1019,11 +1017,13 @@ input[type=range]::-webkit-slider-thumb{
 //  CHRONOLOGICAL ORDER: bars processed strictly index+1 after index; no
 //  look-back into future indices. Scrub/fast-forward uses the same pipeline.
 // ════════════════════════════════════════════════════════════════════════════
-// ── OANDA CONFIG ──
-// Set your OANDA credentials here (or via the Settings drawer at runtime)
-const OANDA_INSTRUMENT = 'XAU_USD';
-let OANDA_ACCOUNT_ID = '';   // populated from Settings input
-let OANDA_ACCESS_TOKEN = ''; // populated from Settings input
+// ── TWELVE DATA CONFIG ──
+const TD_SYMBOL     = 'XAU/USD';
+const TD_BASE       = 'https://api.twelvedata.com';
+let   TD_API_KEY    = '';          // populated from Setup input
+
+let _tdPollTimer  = null;         // setInterval handle for live price polling
+let _tdPollActive = false;
 
 const CFG = {
   RISK_PCT     : 1.0,
@@ -1059,8 +1059,6 @@ let consecutiveWins   = 0;
 let tradingLocked     = false;
 let riskHalved        = false;
 
-let oandaReader = null;  // ReadableStream reader for OANDA pricing stream
-let oandaAbort  = null;  // AbortController for cancelling the stream
 let authed = false, botOn = false;
 let bid = 0, ask = 0, mid = 0, prevMid = 0;
 let balance = null, balCcy = 'USD';
@@ -3456,6 +3454,11 @@ function closeDrawer() {
 
 // ── SETTINGS ──
 function loadSettings() {
+  // Restore Twelve Data API key
+  try {
+    const savedKey = localStorage.getItem('pabotTDKey');
+    if (savedKey) { TD_API_KEY = savedKey; $('tdApiKey').value = savedKey; }
+  } catch(e) {}
   try {
     const saved = JSON.parse(localStorage.getItem('pabotCFG') || '{}');
     if(saved.DEMO_BALANCE > 0) { CFG.DEMO_BALANCE = saved.DEMO_BALANCE; demoBalance = saved.DEMO_BALANCE; demoStartBal = saved.DEMO_BALANCE; }
@@ -3649,10 +3652,7 @@ function checkRiskOverflow(slDist, quality, useBalance) {
 // ── OANDA FEED ENGINE ──
 // Streams live bid/ask from the OANDA v20 pricing endpoint using the
 // Fetch Streaming API (OANDA pricing stream uses chunked JSON lines).
-// Candle history bootstrapped via OANDA v20 instruments/candles REST endpoint.
 // Internal M1/M5/M15 candle builder mirrors the Python engine logic exactly.
-
-let _oandaReconTimer = null;
 
 // ── INTERNAL CANDLE BUILDER STATE ──
 // One forming bar per timeframe, updated tick-by-tick.
@@ -3709,128 +3709,137 @@ function _processTick(midPrice, epochSec) {
 }
 
 // Bootstrap candle history from OANDA v20 instruments/candles REST endpoint.
-async function _fetchOandaHistory() {
-  if (!OANDA_ACCESS_TOKEN || !OANDA_ACCOUNT_ID) return false;
-  const base = 'https://api-fxtrade.oanda.com/v3';
-  const headers = { 'Authorization': `Bearer ${OANDA_ACCESS_TOKEN}`, 'Content-Type': 'application/json' };
+// ── Fetch historical candles from Twelve Data for M1 / M5 / M15 ──
+async function _fetchTDHistory() {
+  if (!TD_API_KEY) return false;
   const specs = [
-    { gran: 60,  key: 'M1',  count: 500 },
-    { gran: 300, key: 'M5',  count: 200 },
-    { gran: 900, key: 'M15', count: 100 },
+    { gran: 60,  interval: '1min',  count: 500 },
+    { gran: 300, interval: '5min',  count: 200 },
+    { gran: 900, interval: '15min', count: 100 },
   ];
   let anyLoaded = false;
-  for (const { gran, key, count } of specs) {
+  for (const { gran, interval, count } of specs) {
     try {
-      const url = `${base}/instruments/${OANDA_INSTRUMENT}/candles?granularity=${key}&count=${count}&price=M`;
-      const res = await fetch(url, { headers });
-      if (!res.ok) { addSignal('warn', `OANDA history ${key}: HTTP ${res.status}`, null); continue; }
+      const url = `${TD_BASE}/time_series?symbol=${encodeURIComponent(TD_SYMBOL)}&interval=${interval}&outputsize=${count}&apikey=${TD_API_KEY}`;
+      const res  = await fetch(url);
       const json = await res.json();
-      const arr = (json.candles || [])
-        .filter(c => c.complete)
-        .map(c => ({
-          epoch: Math.floor(new Date(c.time).getTime() / 1000),
-          open: +c.mid.o, high: +c.mid.h, low: +c.mid.l, close: +c.mid.c
-        }));
+      if (json.status === 'error') {
+        addSignal('warn', `TD history ${interval}: ${json.message}`, null);
+        continue;
+      }
+      const values = json.values || [];
+      // TD returns newest-first — reverse so array is chronological
+      const arr = values.slice().reverse().map(v => ({
+        epoch: Math.floor(new Date(v.datetime.replace(' ', 'T') + 'Z').getTime() / 1000),
+        open:  +v.open, high: +v.high, low: +v.low, close: +v.close,
+      }));
       if (arr.length) {
         candles[gran] = arr;
-        addSignal('info', `✓ ${arr.length} ${key} candles loaded`, null);
+        addSignal('info', `✓ ${arr.length} ${interval} candles loaded`, null);
         anyLoaded = true;
       }
     } catch(e) {
-      addSignal('warn', `OANDA history ${key}: ${e.message}`, null);
+      addSignal('warn', `TD history ${interval}: ${e.message}`, null);
     }
   }
   if (anyLoaded) drawChart();
   return anyLoaded;
 }
 
-// Parse a single JSON line from the OANDA pricing stream.
-function _handleOandaLine(line) {
-  if (!line.trim()) return;
-  let msg;
-  try { msg = JSON.parse(line); } catch { return; }
-  if (msg.type === 'HEARTBEAT') return;
-  if (msg.errorCode) { addSignal('warn', `OANDA stream: ${msg.errorMessage || msg.errorCode}`, null); return; }
-  if (msg.type !== 'PRICE') return;
+// ── Poll Twelve Data every 10 s for the latest M1 price tick ──
+async function _tdPollOnce() {
+  if (!TD_API_KEY) return;
+  try {
+    const url = `${TD_BASE}/time_series?symbol=${encodeURIComponent(TD_SYMBOL)}&interval=1min&outputsize=2&apikey=${TD_API_KEY}`;
+    const res  = await fetch(url);
+    const json = await res.json();
+    if (json.status === 'error') {
+      addSignal('warn', `TD poll: ${json.message}`, null);
+      return;
+    }
+    const values = json.values || [];
+    if (!values.length) return;
 
-  const newBid = parseFloat(msg.bids?.[0]?.price ?? 0);
-  const newAsk = parseFloat(msg.asks?.[0]?.price ?? 0);
-  if (!newBid || !newAsk) return;
+    // values[0] = newest (forming candle), values[1] = last completed
+    const forming = values[0];
+    const completed = values[1];
 
-  bid = newBid; ask = newAsk;
-  const newMid = (bid + ask) / 2;
-  const epochSec = Math.floor(Date.now() / 1000);
+    const closePrice = parseFloat(forming.close);
+    if (!closePrice) return;
 
-  if (mid && newMid !== mid) {
-    const diff = newMid - mid, dir = diff > 0 ? 'up' : 'dn';
-    const chgEl = $('priceChg');
-    chgEl.textContent = `${diff > 0 ? '+' : ''}${diff.toFixed(2)}`;
-    chgEl.className = `price-chg ${dir}`;
-    flashPrice(dir);
+    // Simulate bid/ask with a realistic 0.20 pt spread
+    const spread = 0.20;
+    bid = closePrice - spread / 2;
+    ask = closePrice + spread / 2;
+    const newMid = (bid + ask) / 2;
+    const epochSec = Math.floor(new Date(forming.datetime.replace(' ', 'T') + 'Z').getTime() / 1000);
+
+    // Update price display
+    if (mid && newMid !== mid) {
+      const diff = newMid - mid, dir = diff > 0 ? 'up' : 'dn';
+      const chgEl = $('priceChg');
+      chgEl.textContent = `${diff > 0 ? '+' : ''}${diff.toFixed(2)}`;
+      chgEl.className   = `price-chg ${dir}`;
+      flashPrice(dir);
+    }
+    prevMid = mid; mid = newMid;
+    $('priceMain').textContent = mid.toFixed(2);
+    updatePriceBadges(bid, ask);
+
+    // If the completed candle is newer than our last stored M1 bar, add it
+    if (completed) {
+      const compEpoch = Math.floor(new Date(completed.datetime.replace(' ', 'T') + 'Z').getTime() / 1000);
+      const m1 = candles[60];
+      if (!m1.length || compEpoch > m1[m1.length - 1].epoch) {
+        m1.push({
+          epoch: compEpoch,
+          open:  +completed.open, high: +completed.high,
+          low:   +completed.low,  close: +completed.close,
+        });
+        // Trim to 600 bars max
+        if (m1.length > 600) m1.splice(0, m1.length - 600);
+      }
+    }
+
+    // Feed into candle builder and strategy
+    _processTick(newMid, epochSec);
+    checkDemoPositions();
+    if (!replay.active) runStrategy();
+
+  } catch(e) {
+    addSignal('warn', `TD poll error: ${e.message}`, null);
   }
-  prevMid = mid; mid = newMid;
-  $('priceMain').textContent = mid.toFixed(2);
-  updatePriceBadges(bid, ask);
-
-  // Feed tick into the internal candle builder (mirrors Python process_tick)
-  _processTick(mid, epochSec);
-
-  checkDemoPositions();
-  if (!replay.active) runStrategy();
 }
 
-// Start the OANDA streaming connection.
+// ── Start Twelve Data live feed (replaces OANDA streaming connect) ──
 async function connect() {
-  if (oandaAbort) { try { oandaAbort.abort(); } catch(e) {} }
-  clearTimeout(_oandaReconTimer);
+  // Stop any existing poll
+  if (_tdPollTimer) { clearInterval(_tdPollTimer); _tdPollTimer = null; }
+  _tdPollActive = false;
   setConn('wait');
 
-  if (!OANDA_ACCESS_TOKEN || !OANDA_ACCOUNT_ID) {
-    addSignal('warn', 'OANDA credentials not set — enter Account ID and Access Token in ⚙ Setup, then click Connect.', null);
+  if (!TD_API_KEY) {
+    addSignal('warn', 'Twelve Data API key not set — enter it in Setup, then click Connect.', null);
     setConn('disconnected');
     return;
   }
 
-  // Load candle history before opening the stream
-  await _fetchOandaHistory();
-
-  oandaAbort = new AbortController();
-  const url = `https://stream-fxtrade.oanda.com/v3/accounts/${OANDA_ACCOUNT_ID}/pricing/stream?instruments=${OANDA_INSTRUMENT}`;
-  const headers = { 'Authorization': `Bearer ${OANDA_ACCESS_TOKEN}` };
-
-  try {
-    const res = await fetch(url, { headers, signal: oandaAbort.signal });
-    if (!res.ok) {
-      addSignal('warn', `OANDA stream: HTTP ${res.status} — check credentials`, null);
-      setConn('disconnected');
-      _oandaReconTimer = setTimeout(connect, 8000);
-      return;
-    }
-    setConn('on');
-    authed = true;
-    addSignal('info', 'Connected to OANDA — live XAUUSD data streaming', null);
-
-    oandaReader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-
-    while (true) {
-      const { done, value } = await oandaReader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      // OANDA sends each JSON object on its own line
-      const lines = buffer.split('\n');
-      buffer = lines.pop(); // keep any incomplete trailing chunk
-      for (const line of lines) _handleOandaLine(line);
-    }
-  } catch(e) {
-    if (e.name === 'AbortError') return; // intentional disconnect — do not reconnect
-    addSignal('warn', `OANDA stream disconnected: ${e.message} — reconnecting in 5s`, null);
+  // Load history first
+  const ok = await _fetchTDHistory();
+  if (!ok) {
+    addSignal('warn', 'TD: could not load candle history — check your API key.', null);
+    setConn('disconnected');
+    return;
   }
 
-  setConn('disconnected');
-  authed = false;
-  _oandaReconTimer = setTimeout(connect, 5000);
+  setConn('on');
+  authed = true;
+  _tdPollActive = true;
+  addSignal('info', 'Connected to Twelve Data — XAU/USD live feed active (polling every 10 s)', null);
+
+  // Poll immediately then every 10 seconds
+  await _tdPollOnce();
+  _tdPollTimer = setInterval(() => { if (_tdPollActive) _tdPollOnce(); }, 10000);
 }
 
 // ── CONTINUATION EVALUATION ENGINE ──
@@ -4076,49 +4085,11 @@ function runStrategy() {
 
 // ── LIVE TRADE (OANDA) ──
 // Places a market order via the OANDA v20 Orders API.
-// SL and TP are set as attached orders using point-based distances from CFG.
+// Live order placement — demo-only with Twelve Data feed (no broker API)
 async function placeLiveTrade(dir, ob) {
-  if (!authed || !OANDA_ACCESS_TOKEN || !OANDA_ACCOUNT_ID) return;
-  const isBuy = dir === 'UP';
-  // Use the same sizing logic as the demo engine
-  const riskAmt = (demoBalance || 1000) * CFG.RISK_PCT / 100;
-  // Lot size: 1 lot XAUUSD = 100 oz; pip value ~$1 per 0.01 pt per 0.01 lot
-  // This is a placeholder — size your lots according to your account margin.
-  const units = isBuy ? 1 : -1; // 1 unit = 1 oz (adjust as needed)
-  const body = {
-    order: {
-      type: 'MARKET',
-      instrument: OANDA_INSTRUMENT,
-      units: String(units),
-      timeInForce: 'FOK',
-      positionFill: 'DEFAULT',
-    }
-  };
-  try {
-    const res = await fetch(
-      `https://api-fxtrade.oanda.com/v3/accounts/${OANDA_ACCOUNT_ID}/orders`,
-      {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${OANDA_ACCESS_TOKEN}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
-      }
-    );
-    const data = await res.json();
-    if (data.errorCode) {
-      addSignal('warn', `OANDA order error: ${data.errorMessage || data.errorCode}`, null);
-      return;
-    }
-    const fill = data.orderFillTransaction;
-    if (fill) {
-      const fillPrice = parseFloat(fill.price);
-      const t = { id: fill.id, dir: isBuy ? 'BUY' : 'SELL', entry: fillPrice.toFixed(2), status: 'open', pnl: null };
-      tradeLog.unshift(t);
-      updateLastTrade(t);
-      addSignal(isBuy ? 'buy' : 'sell', `OANDA order filled @ ${fillPrice.toFixed(2)} — ID ${fill.id}`, fillPrice);
-    }
-  } catch(e) {
-    addSignal('warn', `OANDA order failed: ${e.message}`, null);
-  }
+  // Twelve Data provides price data only; live order execution requires a broker API.
+  // All trading runs through the demo engine below.
+  addSignal('info', `[Demo] Signal: ${dir} — routed to demo engine`, null);
 }
 
 // ── TOAST ──
@@ -4165,15 +4136,14 @@ $('startBtnM').addEventListener('click', startBot);
 $('stopBtnM').addEventListener('click', stopBot);
 
 $('authBtn').addEventListener('click', ()=>{
-  const acct = $('oandaAccountId').value.trim();
-  const tok  = $('oandaToken').value.trim();
-  if (!acct || !tok) {
-    addSignal('warn', 'Enter both OANDA Account ID and Access Token before connecting.', null);
+  const key = $('tdApiKey').value.trim();
+  if (!key) {
+    addSignal('warn', 'Enter your Twelve Data API key before connecting.', null);
     return;
   }
-  OANDA_ACCOUNT_ID   = acct;
-  OANDA_ACCESS_TOKEN = tok;
-  addSignal('info', 'OANDA credentials set — connecting…', null);
+  TD_API_KEY = key;
+  try { localStorage.setItem('pabotTDKey', key); } catch(e) {}
+  addSignal('info', 'Twelve Data API key set — connecting…', null);
   connect();
 });
 
@@ -4897,64 +4867,81 @@ function btCheckReady() {
 });
 
 async function fetchBtCandles(granularity, startEpoch, endEpoch, onProgress) {
-  // Fetches historical candles from the OANDA v20 REST API in paginated chunks.
-  // OANDA granularity map: 60→M1, 300→M5, 900→M15
-  const granMap = { 60: 'M1', 300: 'M5', 900: 'M15' };
-  const granKey = granMap[granularity] || 'M1';
-  const base    = 'https://api-fxtrade.oanda.com/v3';
-  const headers = { 'Authorization': `Bearer ${OANDA_ACCESS_TOKEN}`, 'Content-Type': 'application/json' };
-  const MAX     = 5000; // OANDA max candles per request
-  const all     = [];
-  let   cursor  = endEpoch;
-  let   reqCount = 0;
+  // Fetches historical candles from Twelve Data for backtest.
+  // TD free tier returns up to 5000 bars per request.
+  const intervalMap = { 60: '1min', 300: '5min', 900: '15min' };
+  const interval = intervalMap[granularity] || '1min';
+  const all = [];
   btFetching = true;
+
   try {
+    if (!TD_API_KEY) {
+      addSignal('warn', 'BT: Twelve Data API key not set — enter it in Setup first', null);
+      return null;
+    }
+    if (btCancelled) return null;
+
+    // Build date strings TD expects: YYYY-MM-DD HH:MM:SS
+    const fmtDT = (epochSec) => {
+      const d = new Date(epochSec * 1000);
+      const pad = n => String(n).padStart(2, '0');
+      return `${d.getUTCFullYear()}-${pad(d.getUTCMonth()+1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:00`;
+    };
+
+    // TD can return up to 5000 bars; paginate by shifting the end date back if needed
+    let cursor = endEpoch;
+    let reqCount = 0;
+    const PAGE = 5000;
+
     while (cursor > startEpoch) {
       if (btCancelled) return null;
-      if (!OANDA_ACCESS_TOKEN || !OANDA_ACCOUNT_ID) {
-        addSignal('warn', 'BT: OANDA credentials not set — enter Account ID and Token in ⚙ Setup', null);
-        return null;
-      }
-      // OANDA uses RFC3339 timestamps. We convert epoch seconds to ISO strings.
-      const fromISO = new Date(startEpoch * 1000).toISOString();
-      const toISO   = new Date(cursor * 1000).toISOString();
-      const url = `${base}/instruments/${OANDA_INSTRUMENT}/candles?granularity=${granKey}&from=${fromISO}&to=${toISO}&count=${MAX}&price=M`;
+      const startDT = fmtDT(startEpoch);
+      const endDT   = fmtDT(cursor);
+      const url = `${TD_BASE}/time_series?symbol=${encodeURIComponent(TD_SYMBOL)}&interval=${interval}&start_date=${encodeURIComponent(startDT)}&end_date=${encodeURIComponent(endDT)}&outputsize=${PAGE}&apikey=${TD_API_KEY}`;
+
       let data;
       try {
-        const res = await fetch(url, { headers });
-        if (!res.ok) {
-          addSignal('warn', `BT: OANDA HTTP ${res.status} for ${granKey}`, null);
-          break;
-        }
+        const res = await fetch(url);
         data = await res.json();
       } catch(e) {
-        addSignal('warn', `BT: OANDA request failed — ${e.message}`, null);
+        addSignal('warn', `BT: TD request failed — ${e.message}`, null);
         break;
       }
-      if (data.errorCode) { addSignal('warn', `BT: OANDA error — ${data.errorMessage || data.errorCode}`, null); break; }
-      const raw = (data.candles || []).filter(c => c.complete);
-      if (!raw.length) break;
-      const chunk = raw.map(c => ({
-        epoch: Math.floor(new Date(c.time).getTime() / 1000),
-        open: +c.mid.o, high: +c.mid.h, low: +c.mid.l, close: +c.mid.c
+      if (data.status === 'error') {
+        addSignal('warn', `BT: TD error — ${data.message}`, null);
+        break;
+      }
+      const values = data.values || [];
+      if (!values.length) break;
+
+      // TD returns newest-first — reverse to chronological
+      const chunk = values.slice().reverse().map(v => ({
+        epoch: Math.floor(new Date(v.datetime.replace(' ', 'T') + 'Z').getTime() / 1000),
+        open: +v.open, high: +v.high, low: +v.low, close: +v.close,
       }));
+
       all.unshift(...chunk);
       reqCount++;
       if (onProgress) onProgress(reqCount, chunk.length);
-      // Paginate backwards: move cursor before the earliest candle we just received
+
+      // If we got fewer than PAGE bars, we've reached the start
+      if (values.length < PAGE) break;
+
+      // Move cursor back past the earliest bar we received
       cursor = chunk[0].epoch - granularity;
       if (cursor <= startEpoch) break;
-      await new Promise(r => setTimeout(r, 100)); // respect OANDA rate limits
+      await new Promise(r => setTimeout(r, 250)); // respect TD rate limits
     }
   } finally {
     btFetching = false;
   }
+
   all.sort((a, b) => a.epoch - b.epoch);
   const filtered = all.filter(c => c.epoch >= startEpoch && c.epoch <= endEpoch);
   if (filtered.length < 500 && btSelectedDays > 7) {
-    addSignal('warn', `⚠ Data shortage: only ${filtered.length} M1 candles found. Backtest may not cover full ${btSelectedDays} days.`, null);
+    addSignal('warn', `⚠ Data shortage: only ${filtered.length} bars found. Free TD tier has limited history — upgrade for more.`, null);
   }
-  return filtered.filter((c, i, arr) => i === 0 || c.epoch !== arr[i - 1].epoch);
+  return filtered.filter((c, i, arr) => i === 0 || c.epoch !== arr[i-1].epoch);
 }
 
 function buildM5FromM1(m1) {
@@ -4983,8 +4970,8 @@ function setBtProgress(pct, status) {
 
 async function startBacktest() {
   if (btRunning) return;
-  if (!OANDA_ACCESS_TOKEN || !OANDA_ACCOUNT_ID) {
-    addSignal('warn', 'Backtest: enter OANDA Account ID and Access Token in ⚙ Setup first', null);
+  if (!TD_API_KEY) {
+    addSignal('warn', 'Backtest: enter your Twelve Data API key in Setup first', null);
     return;
   }
   const startBal = parseFloat($('btStartBal').value);
@@ -5506,8 +5493,8 @@ setInterval(() => {
   });
 }, 60 * 1000);
 
-addSignal('info','XAUUSD PA Bot — OANDA feed engine ready.',null);
-addSignal('info','Enter your OANDA Account ID and Access Token in ⚙ Setup, then click Connect.',null);
+addSignal('info','XAUUSD PA Bot — Twelve Data feed engine ready.',null);
+addSignal('info','Enter your Twelve Data API key in Setup, then click Connect to start the live feed.',null);
 addSignal('info','Strategy: M5 HTF bias → M1 confirmation + execution. M15 provides EQ reference only. All M1 setups require M5 structural alignment.',null);
 </script>
 </body>
